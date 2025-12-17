@@ -1,0 +1,35 @@
+# --- Save Right-Click Coordinates to Downloads Folder ---
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# Get user's Downloads folder
+$downloads = [Environment]::GetFolderPath('UserProfile') + "\Downloads"
+$outputFile = Join-Path $downloads "MouseCoordinates.txt"
+
+Write-Host "Monitoring for right-clicks... (Press Ctrl+C to stop)"
+Write-Host "Coordinates will be saved to: $outputFile"
+
+# Add mouse event listener
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class MouseListener {
+    [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int vKey);
+}
+"@
+
+# Virtual key code for right mouse button
+$VK_RBUTTON = 0x02
+
+while ($true) {
+    Start-Sleep -Milliseconds 50
+    if ([MouseListener]::GetAsyncKeyState($VK_RBUTTON) -band 0x8000) {
+        $pos = [System.Windows.Forms.Cursor]::Position
+        $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $line = "$time : X=$($pos.X), Y=$($pos.Y)"
+        Add-Content -Path $outputFile -Value $line
+        Write-Host "Saved -> $line"
+        Start-Sleep -Seconds 1  # debounce to avoid multiple captures per click
+    }
+}
