@@ -81,7 +81,7 @@ $display = @{ X = 1174; Y = 294 }
 $excel   = @{ X = 1171; Y = 265 }
 
 # === List of codes to download this run ===
-$texts = @("vafhts","vafvella","vafwolve","vafmacar","va3001","va4001","va4002")
+$texts = @("cilpalic", "cilparc2", "cilparc3", "cilparch", "cilpbou2", "cilpboun", "cilpcamp", "cilpforr", "cilpfre1", "cilpfre2", "cilpfre3", "cilpfre4", "cilpgate", "cilpgipp", "cilphume", "cilpinne", "cilpkeys", "cilpmead", "cilppink", "cilpquee", "cilproya", "cilpsmit", "cp1hta", "cp1hts", "cp1mt1", "cp2001", "cp2002", "cp3001", "cp3002", "cp3003", "cp3004", "cp3005", "cp3006", "cp3007", "cp3008", "cp3009", "cp4001", "cp4002", "cp4003", "cp4004", "cp4005", "cp4006", "cp4007", "cp4008", "cp4009", "cp5001", "cp5002")
 
 # Keep track ONLY of files successfully downloaded+moved this run
 $movedCodes = New-Object System.Collections.Generic.List[string]
@@ -210,3 +210,4 @@ $excelApp.Run("MergeFilesIntoOneSheetWithName")
 Start-Sleep -Seconds 5
 $excelApp.Quit()
 [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excelApp) | Out-Null
+
