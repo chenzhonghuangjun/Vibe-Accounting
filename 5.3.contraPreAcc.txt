@@ -1,0 +1,364 @@
+Option Explicit 
+
+'================= HELPER FUNCTIONS =======================
+
+' Normalize text for key: trim + collapse spaces + uppercase
+Private Function NormalizeKeyPart(ByVal s As Variant) As String
+    Dim tmp As String
+    tmp = CStr(s)
+    
+    On Error Resume Next
+    ' Application.Trim collapses multiple spaces to single and trims ends
+    tmp = Application.WorksheetFunction.Trim(tmp)
+    On Error GoTo 0
+    
+    NormalizeKeyPart = UCase$(tmp)
+End Function
+
+' Clean numeric value: remove thousand separators, handle text
+Private Function CleanNumber(ByVal v As Variant) As Double
+    Dim s As String
+    s = CStr(v)
+    s = Replace(s, ",", "")
+    s = Trim$(s)
+    If Len(s) = 0 Or Not IsNumeric(s) Then
+        CleanNumber = 0
+    Else
+        CleanNumber = CDbl(s)
+    End If
+End Function
+
+'================= MAIN MACRO ==============================
+
+Sub FillNetAndReverted_FlexibleMatch()
+
+    '========================
+    ' CONFIG – EDIT HERE
+    '========================
+    Dim wsCur As Worksheet          ' First tab: destination / accrual sheet
+    Dim wsSrc As Worksheet          ' Second tab: source sheet
+    
+    Dim nameCurSheet As String
+    Dim nameSrcSheet As String
+    
+    ' If nameCurSheet is blank ⇒ use ActiveSheet
+    nameCurSheet = ""               ' e.g. "CFS"; "" = current sheet
+    nameSrcSheet = "Sheet1"         ' name of the second/source sheet
+    
+    '--- FIRST TAB: columns (letters) ---
+    ' 1) Matching group of columns (account, trust, property, etc.)
+    Dim keyColsCurL As Variant
+    keyColsCurL = Array("B", "C")   ' <<<<<< EDIT as needed
+    
+    ' 2) Transaction text column (e.g. "Net amount", "Reverted amount")
+    Dim colTranCurL As String
+    colTranCurL = "F"               ' <<<<<< EDIT
+    
+    ' 3) Amount column to fill
+    Dim colAmtCurL As String
+    colAmtCurL = "S"                ' <<<<<< EDIT
+    
+    '--- SECOND TAB: columns (letters) ---
+    ' Matching group of columns on second tab (same structure as first)
+    Dim keyColsSrcL As Variant
+    keyColsSrcL = Array("B", "A")   ' <<<<<< EDIT as needed
+    
+    ' Amount column on second tab (source)
+    Dim colAmtSrcL As String
+    colAmtSrcL = "C"                ' <<<<<< EDIT
+    
+    '--- Transaction labels (case-insensitive) ---
+    Dim labelNet As String
+    Dim labelRev As String
+    
+    labelNet = "Net amount"
+    labelRev = "Reverted amount"
+    
+    ' Header rows
+    Dim headerRowCur As Long, headerRowSrc As Long
+    headerRowCur = 1
+    headerRowSrc = 1
+    
+    ' OPTIONAL: restrict CURRENT SHEET row range
+    Dim processRowFrom As Long
+    Dim processRowTo   As Long
+    
+    processRowFrom = 0              ' e.g. 20 → start at row 20; 0 = auto
+    processRowTo   = 0              ' e.g. 80 → end at row 80; 0 = auto
+    
+    '========================
+    ' INTERNAL – DO NOT EDIT
+    '========================
+    Dim colTranCur As Long, colAmtCur As Long
+    Dim colAmtSrc As Long
+    Dim keyColsCur() As Long, keyColsSrc() As Long
+    Dim keyCount As Long, iKey As Long
+    
+    Dim dictPos As Object, dictNeg As Object, dictKeyCur As Object
+    Dim lastRowSrc As Long, lastRowCur As Long
+    Dim firstRow As Long, lastRowToUse As Long
+    Dim labelNetU As String, labelRevU As String
+    
+    Dim scrUpd As Boolean, evt As Boolean, calcMode As XlCalculation
+    Dim t0 As Double
+    Dim baseIdx As Long
+    Dim useAutoStop As Boolean
+    
+    '--- speed settings ---
+    t0 = Timer
+    scrUpd = Application.ScreenUpdating
+    evt = Application.EnableEvents
+    calcMode = Application.Calculation
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    
+    On Error GoTo CleanExit
+    
+    '---- Validate matching column arrays ----
+    If Not IsArray(keyColsCurL) Or Not IsArray(keyColsSrcL) Then
+        MsgBox "Please set keyColsCurL and keyColsSrcL as arrays of column letters.", vbCritical
+        GoTo CleanExit
+    End If
+    
+    If UBound(keyColsCurL) - LBound(keyColsCurL) <> UBound(keyColsSrcL) - LBound(keyColsSrcL) Then
+        MsgBox "keyColsCurL and keyColsSrcL must contain the same number of items.", vbCritical
+        GoTo CleanExit
+    End If
+    
+    keyCount = UBound(keyColsCurL) - LBound(keyColsCurL) + 1
+    If keyCount <= 0 Then
+        MsgBox "You must specify at least one matching column.", vbCritical
+        GoTo CleanExit
+    End If
+    
+    ReDim keyColsCur(0 To keyCount - 1)
+    ReDim keyColsSrc(0 To keyCount - 1)
+    
+    '---- Pick sheets ----
+    If Len(nameCurSheet) = 0 Then
+        Set wsCur = ActiveSheet
+    Else
+        Set wsCur = ThisWorkbook.Worksheets(nameCurSheet)
+    End If
+    
+    Set wsSrc = ThisWorkbook.Worksheets(nameSrcSheet)
+    
+    '---- Convert letters to column numbers (first tab) ----
+    baseIdx = LBound(keyColsCurL)
+    
+    With wsCur
+        For iKey = 0 To keyCount - 1
+            keyColsCur(iKey) = .Columns(CStr(keyColsCurL(baseIdx + iKey))).Column
+        Next iKey
+        
+        colTranCur = .Columns(colTranCurL).Column
+        colAmtCur = .Columns(colAmtCurL).Column
+        
+        ' Last row is determined by transaction text column
+        lastRowCur = .Cells(.Rows.Count, colTranCur).End(xlUp).Row
+    End With
+    
+    '---- Convert letters to column numbers (second tab) ----
+    baseIdx = LBound(keyColsSrcL)
+    
+    With wsSrc
+        For iKey = 0 To keyCount - 1
+            keyColsSrc(iKey) = .Columns(CStr(keyColsSrcL(baseIdx + iKey))).Column
+        Next iKey
+        
+        colAmtSrc = .Columns(colAmtSrcL).Column
+        
+        ' Use first key column as anchor for last row in source
+        lastRowSrc = .Cells(.Rows.Count, keyColsSrc(0)).End(xlUp).Row
+    End With
+    
+    '========================
+    ' BUILD SUMS FROM SECOND TAB
+    '========================
+    Dim srcFirstRow As Long, srcRowCount As Long, r As Long
+    Dim arrAmtSrc As Variant
+    Dim arrKeySrc() As String
+    Dim k As String, part As String
+    Dim amt As Double
+    
+    Set dictPos = CreateObject("Scripting.Dictionary") ' sums of positives
+    Set dictNeg = CreateObject("Scripting.Dictionary") ' sums of negatives
+    dictPos.CompareMode = vbTextCompare
+    dictNeg.CompareMode = vbTextCompare
+    
+    srcFirstRow = headerRowSrc + 1
+    If lastRowSrc < srcFirstRow Then GoTo AfterDict ' no data
+    
+    srcRowCount = lastRowSrc - srcFirstRow + 1
+    ReDim arrKeySrc(1 To srcRowCount)
+    
+    With wsSrc
+        arrAmtSrc = .Range(.Cells(srcFirstRow, colAmtSrc), _
+                           .Cells(lastRowSrc, colAmtSrc)).Value
+    End With
+    
+    For r = 1 To srcRowCount
+        Dim rowSrc As Long
+        rowSrc = srcFirstRow + r - 1
+        
+        ' Build composite key from all matching columns on second tab
+        k = ""
+        For iKey = 0 To keyCount - 1
+            part = NormalizeKeyPart(wsSrc.Cells(rowSrc, keyColsSrc(iKey)).Value)
+            If part <> "" Then
+                If k <> "" Then k = k & "||"
+                k = k & part
+            End If
+        Next iKey
+        
+        arrKeySrc(r) = k
+        
+        amt = CleanNumber(arrAmtSrc(r, 1))
+        
+        If k <> "" And amt <> 0 Then
+            If amt > 0 Then
+                If dictPos.Exists(k) Then
+                    dictPos(k) = dictPos(k) + amt
+                Else
+                    dictPos(k) = amt
+                End If
+            ElseIf amt < 0 Then
+                If dictNeg.Exists(k) Then
+                    dictNeg(k) = dictNeg(k) + amt
+                Else
+                    dictNeg(k) = amt
+                End If
+            End If
+        End If
+    Next r
+    
+AfterDict:
+    '========================
+    ' DETERMINE ROW RANGE ON FIRST TAB
+    '========================
+    useAutoStop = (processRowFrom = 0 And processRowTo = 0)
+    
+    If processRowFrom > 0 Then
+        firstRow = processRowFrom
+    Else
+        firstRow = headerRowCur + 1
+    End If
+    
+    If processRowTo > 0 And processRowTo <= lastRowCur Then
+        lastRowToUse = processRowTo
+    Else
+        lastRowToUse = lastRowCur
+    End If
+    
+    If lastRowToUse < firstRow Then GoTo HighlightUnmatched
+    
+    '========================
+    ' LOAD TRANSACTION TEXT FROM FIRST TAB
+    '========================
+    Dim curRowCount As Long
+    curRowCount = lastRowToUse - firstRow + 1
+    
+    Dim arrTranCur As Variant
+    Dim transTxt As String
+    Dim blankCount As Long
+    Dim primaryVal As String
+    
+    With wsCur
+        arrTranCur = .Range(.Cells(firstRow, colTranCur), _
+                            .Cells(lastRowToUse, colTranCur)).Value
+    End With
+    
+    labelNetU = UCase$(Trim$(labelNet))
+    labelRevU = UCase$(Trim$(labelRev))
+    
+    blankCount = 0
+    Set dictKeyCur = CreateObject("Scripting.Dictionary")
+    dictKeyCur.CompareMode = vbTextCompare
+    
+    '========================
+    ' PROCESS FIRST TAB ROWS
+    '========================
+    For r = 1 To curRowCount
+        Dim rowCur As Long
+        
+        rowCur = firstRow + r - 1
+        primaryVal = CStr(arrTranCur(r, 1))   ' transaction text column
+        
+        ' --- blank logic ---
+        If Trim$(primaryVal) = "" Then
+            If useAutoStop Then
+                blankCount = blankCount + 1
+                If blankCount >= 10 Then Exit For
+            End If
+            GoTo NextRowLoop
+        Else
+            If useAutoStop Then blankCount = 0
+        End If
+        
+        ' Build composite key from matching group on first tab
+        k = ""
+        For iKey = 0 To keyCount - 1
+            part = NormalizeKeyPart(wsCur.Cells(rowCur, keyColsCur(iKey)).Value)
+            If part <> "" Then
+                If k <> "" Then k = k & "||"
+                k = k & part
+            End If
+        Next iKey
+        
+        If k = "" Then GoTo NextRowLoop
+        
+        If Not dictKeyCur.Exists(k) Then dictKeyCur.Add k, True
+        
+        transTxt = UCase$(Trim$(primaryVal))
+        
+        ' ====== ONLY FILL AMOUNT IN NET/REVERTED ROWS ======
+        If transTxt = labelNetU Then
+            ' Net amount row: use sum of positives for this key
+            If dictPos.Exists(k) Then
+                wsCur.Cells(rowCur, colAmtCur).Value = dictPos(k)
+            End If
+        
+        ElseIf transTxt = labelRevU Then
+            ' Reverted amount row: use sum of negatives for this key
+            If dictNeg.Exists(k) Then
+                wsCur.Cells(rowCur, colAmtCur).Value = dictNeg(k)
+            End If
+        End If
+        ' ===================================================
+        
+NextRowLoop:
+    Next r
+    
+HighlightUnmatched:
+    '========================
+    ' HIGHLIGHT UNMATCHED KEYS ON SECOND TAB
+    '========================
+    If srcRowCount > 0 Then
+        If dictKeyCur Is Nothing Then
+            Set dictKeyCur = CreateObject("Scripting.Dictionary")
+            dictKeyCur.CompareMode = vbTextCompare
+        End If
+        
+        For r = 1 To srcRowCount
+            k = arrKeySrc(r)
+            If k <> "" Then
+                If Not dictKeyCur.Exists(k) Then
+                    ' Colour entire row yellow (or change to single cell if you prefer)
+                    wsSrc.Rows(srcFirstRow + r - 1).Interior.Color = vbYellow
+                    ' e.g. only first key column:
+                    ' wsSrc.Cells(srcFirstRow + r - 1, keyColsSrc(0)).Interior.Color = vbYellow
+                End If
+            End If
+        Next r
+    End If
+    
+CleanExit:
+    ' Restore app settings
+    Application.ScreenUpdating = scrUpd
+    Application.EnableEvents = evt
+    Application.Calculation = calcMode
+    
+    'Debug.Print "Elapsed: " & Format(Timer - t0, "0.000") & " seconds"
+End Sub
