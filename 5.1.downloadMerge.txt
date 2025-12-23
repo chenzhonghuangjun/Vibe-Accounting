@@ -1,11 +1,14 @@
 # =========================
-# UI Automation + Excel Merge
+# UI Automation + Excel Merge + Post-merge Validation + Retry
 # Merge ONLY files downloaded in this run
+# If mismatch -> delete TB file(s) -> re-download -> re-merge
 # =========================
 
 # -------- CONFIGURE YOUR SAVE FOLDER HERE ----------
 $TargetRoot = "C:\Users\AnthonyTran\Downloads"   # <- change this to any folder you want
 # ---------------------------------------------------
+
+$MaxRetries = 2   # how many times to re-download mismatches and re-merge
 
 # Create a fresh time-stamped run folder (ensures no previous files are merged)
 $RunFolder = Join-Path $TargetRoot (Get-Date -Format 'yyyy-MM-dd_HHmmss')
@@ -28,6 +31,7 @@ public class MouseKeyboardHelper {
     public const int LEFTUP = 0x04;
 }
 "@
+
 
 # === Functions ===
 function Click-At($x, $y) {
@@ -74,6 +78,233 @@ function Rename-AndMove-LastDownloadedFile($newName, $destFolder) {
     }
 }
 
+function Download-OneCode($code) {
+    Click-At $textbox.X $textbox.Y
+    Clear-Textbox
+    Type-Text $code
+
+    Click-At $display.X $display.Y
+    Start-Sleep -Seconds 6  # Wait for display to load
+
+    Click-At $excel.X $excel.Y
+    Start-Sleep -Seconds 10 # Wait for Excel download to complete
+
+    return (Rename-AndMove-LastDownloadedFile -newName $code -destFolder $RunFolder)
+}
+
+function Run-MergeAndValidate($runFolder, $codesCsv) {
+    $env:MERGE_TARGET = $runFolder
+    $env:MERGE_CODES  = $codesCsv
+
+    $excelApp = New-Object -ComObject Excel.Application
+    $excelApp.Visible = $true
+    $excelApp.DisplayAlerts = $false
+
+    # workbook to host VBA
+    $hostWb = $excelApp.Workbooks.Add()
+
+    $macroCode = @'
+Option Explicit
+
+' Fallback extraction (also used for validation logic)
+Public Function ExtractBetweenLastParens(ByVal txt As String) As String
+    Dim openPos As Long, closePos As Long
+    openPos = InStrRev(txt, "(")
+    closePos = InStrRev(txt, ")")
+    If openPos > 0 And closePos > openPos Then
+        ExtractBetweenLastParens = Mid$(txt, openPos + 1, closePos - openPos - 1)
+    Else
+        ExtractBetweenLastParens = ""
+    End If
+End Function
+
+Public Sub MergeFilesIntoOneSheetWithName_ThenValidate()
+    Dim folderPath As String, codesStr As String
+    Dim texts As Variant
+    Dim i As Long
+    Dim fileName As String
+
+    Dim wbSource As Workbook, wsSource As Worksheet
+    Dim wbDest As Workbook, wsDest As Worksheet
+    Dim lastRowSource As Long, lastRowDest As Long
+    Dim headerCopied As Boolean
+    Dim destNextRow As Long, startTagRow As Long, tagRows As Long
+
+    ' === CHANGE THIS if the "name text" is NOT in column A ===
+    ' A=1, B=2, C=3...
+    Const SRC_TEXT_COL As Long = 1
+
+    Dim savePath As String, mismatchPath As String
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+
+    folderPath = Environ$("MERGE_TARGET")
+    If Len(folderPath) = 0 Then
+        MsgBox "MERGE_TARGET not set. Aborting.", vbCritical
+        GoTo CleanExit
+    End If
+    If Right$(folderPath, 1) <> "\" Then folderPath = folderPath & "\"
+
+    codesStr = Environ$("MERGE_CODES")
+    If Len(codesStr) = 0 Then
+        MsgBox "MERGE_CODES not set. Aborting.", vbCritical
+        GoTo CleanExit
+    End If
+    texts = Split(codesStr, ",")
+
+    ' Create destination workbook
+    Set wbDest = Workbooks.Add(xlWBATWorksheet)
+    Set wsDest = wbDest.Worksheets(1)
+    On Error Resume Next
+    wsDest.Name = "Merged"
+    On Error GoTo 0
+
+    headerCopied = False
+
+    For i = LBound(texts) To UBound(texts)
+        fileName = folderPath & texts(i) & ".xlsx"
+        If Dir(fileName) <> "" Then
+            Set wbSource = Workbooks.Open(fileName, ReadOnly:=True)
+            Set wsSource = wbSource.Sheets(1)
+
+            lastRowSource = wsSource.Cells(wsSource.Rows.Count, 1).End(xlUp).Row
+
+            If Not headerCopied Then
+                ' First paste includes header
+                wsSource.Range("A1:F" & lastRowSource).Copy wsDest.Range("A1")
+                headerCopied = True
+
+                tagRows = Application.Max(0, lastRowSource - 1)
+                startTagRow = 2 ' start tagging from first data row
+            Else
+                ' Subsequent pastes exclude header
+                destNextRow = wsDest.Cells(wsDest.Rows.Count, 1).End(xlUp).Row + 1
+
+                If lastRowSource > 1 Then
+                    wsSource.Range("A2:F" & lastRowSource).Copy wsDest.Range("A" & destNextRow)
+                    tagRows = lastRowSource - 1
+                    startTagRow = destNextRow
+                Else
+                    tagRows = 0
+                End If
+            End If
+
+            ' Tag the source code in column G (bulk fill)
+            If tagRows > 0 Then
+                wsDest.Range(wsDest.Cells(startTagRow, 7), wsDest.Cells(startTagRow + tagRows - 1, 7)).Value = texts(i)
+            End If
+
+            wbSource.Close False
+        End If
+    Next i
+
+    ' If nothing merged, stop
+    If wsDest.Cells(1, 1).Value = "" Then GoTo SaveAndExit
+
+    ' Add headers for new columns
+    wsDest.Cells(1, 7).Value = "FileCode"
+    wsDest.Cells(1, 8).Value = "ExtractedCode"
+    wsDest.Cells(1, 9).Value = "NameMatch"
+
+    lastRowDest = wsDest.Cells(wsDest.Rows.Count, 1).End(xlUp).Row
+
+    ' Column H: LET extraction like your formula (R1C1 version)
+    ' If your Excel doesn't support LET, replace with:
+    ' =ExtractBetweenLastParens(RC<SRC_TEXT_COL>)
+    Dim fExtract As String
+    fExtract = "=LET(txt,RC" & SRC_TEXT_COL & ",openPos,FIND(""@"",SUBSTITUTE(txt,""("",""@"",LEN(txt)-LEN(SUBSTITUTE(txt,""("","""")))),closePos,FIND(""#"",SUBSTITUTE(txt,"")"",""#"",LEN(txt)-LEN(SUBSTITUTE(txt,"")"","""")))),IFERROR(MID(txt,openPos+1,closePos-openPos-1),""""))"
+    wsDest.Range("H2:H" & lastRowDest).FormulaR1C1 = fExtract
+
+    ' Column I: compare ExtractedCode vs FileCode
+    wsDest.Range("I2:I" & lastRowDest).FormulaR1C1 = "=IF(LOWER(TRIM(RC[-1]))=LOWER(TRIM(RC[-2])),""OK"",""MISMATCH"")"
+
+    ' === Validation (robust, does NOT rely on LET) ===
+    Dim codesSeen As Object, firstExt As Object, mismatch As Object
+    Set codesSeen = CreateObject("Scripting.Dictionary")
+    Set firstExt = CreateObject("Scripting.Dictionary")
+    Set mismatch = CreateObject("Scripting.Dictionary")
+
+    Dim r As Long
+    Dim code As String, ext As String
+    Dim rawTxt As String
+
+    For r = 2 To lastRowDest
+        code = LCase$(Trim$(CStr(wsDest.Cells(r, 7).Value)))
+        If Len(code) > 0 Then
+            codesSeen(code) = True
+
+            rawTxt = CStr(wsDest.Cells(r, SRC_TEXT_COL).Value)
+            ext = LCase$(Trim$(ExtractBetweenLastParens(rawTxt)))
+
+            If Len(ext) > 0 Then
+                If Not firstExt.Exists(code) Then
+                    firstExt(code) = ext
+                Else
+                    If firstExt(code) <> ext Then mismatch(code) = True
+                End If
+            End If
+        End If
+    Next r
+
+    Dim k As Variant
+    For Each k In codesSeen.Keys
+        If Not firstExt.Exists(k) Then
+            mismatch(k) = True ' never found any (...) code to validate against
+        ElseIf firstExt(k) <> k Then
+            mismatch(k) = True ' extracted code doesn't equal file code
+        End If
+    Next k
+
+    ' Write mismatch list file (one code per line)
+    mismatchPath = folderPath & "Mismatch_Codes.txt"
+    If Dir(mismatchPath) <> "" Then Kill mismatchPath
+
+    If mismatch.Count > 0 Then
+        Dim f As Integer
+        f = FreeFile
+        Open mismatchPath For Output As #f
+        For Each k In mismatch.Keys
+            Print #f, CStr(k)
+        Next k
+        Close #f
+    End If
+
+    ' Cosmetic
+    wsDest.Columns("A:I").AutoFit
+
+SaveAndExit:
+    ' Save merged workbook (overwrite if exists)
+    savePath = folderPath & "Merged_Files.xlsx"
+    If Dir(savePath) <> "" Then Kill savePath
+    wbDest.SaveAs Filename:=savePath, FileFormat:=xlOpenXMLWorkbook
+
+    If mismatch.Count > 0 Then
+        MsgBox "Merge done, but mismatches found. See: " & mismatchPath, vbExclamation
+    Else
+        MsgBox "Merge + validation completed OK. Saved to: " & savePath, vbInformation
+    End If
+
+CleanExit:
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.DisplayAlerts = True
+End Sub
+'@
+
+    # Inject and run the macro
+    $vbModule = $hostWb.VBProject.VBComponents.Add(1)  # 1 = vbext_ct_StdModule
+    $vbModule.CodeModule.AddFromString($macroCode)
+    $excelApp.Run("MergeFilesIntoOneSheetWithName_ThenValidate")
+
+    Start-Sleep -Seconds 2
+
+    # Quit
+    $excelApp.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excelApp) | Out-Null
+}
+
 # === Coordinates (adjust if needed) ===
 $tab1    = @{ X = 154; Y = 13 }
 $textbox = @{ X = 370; Y = 201 }
@@ -91,19 +322,9 @@ Click-At $tab1.X $tab1.Y
 Press-Enter
 
 # === Step 2: Loop to download each file, then move to this run's folder
-foreach ($text in $texts) {
-    Click-At $textbox.X $textbox.Y
-    Clear-Textbox
-    Type-Text $text
-
-    Click-At $display.X $display.Y
-    Start-Sleep -Seconds 6  # Wait for display to load
-
-    Click-At $excel.X $excel.Y
-    Start-Sleep -Seconds 10 # Wait for Excel download to complete
-
-    if (Rename-AndMove-LastDownloadedFile -newName $text -destFolder $RunFolder) {
-        $movedCodes.Add($text) | Out-Null
+foreach ($code in $texts) {
+    if (Download-OneCode $code) {
+        $movedCodes.Add($code) | Out-Null
     }
 }
 
@@ -113,101 +334,58 @@ if ($movedCodes.Count -eq 0) {
     return
 }
 
-# === Step 3: Launch Excel and merge ONLY the files from this run ===
-# Pass the run folder and only the moved codes to VBA
-$env:MERGE_TARGET = $RunFolder
-$env:MERGE_CODES  = ($movedCodes -join ",")
+# === Step 3: Merge + Validate + Retry mismatches ===
+$attempt = 0
+$mismatchPath = Join-Path $RunFolder "Mismatch_Codes.txt"
 
-$excelApp = New-Object -ComObject Excel.Application
-$excelApp.Visible = $true
-$excelApp.DisplayAlerts = $false
-$workbook = $excelApp.Workbooks.Add()
+do {
+    $codesCsv = ($movedCodes -join ",")
+    Run-MergeAndValidate -runFolder $RunFolder -codesCsv $codesCsv
 
-$macroCode = @'
-Sub MergeFilesIntoOneSheetWithName()
-    Dim folderPath As String
-    Dim fileName As String
-    Dim wbSource As Workbook
-    Dim wsSource As Worksheet
-    Dim wsDest As Worksheet
-    Dim lastRowDest As Long
-    Dim lastRowSource As Long
-    Dim texts As Variant
-    Dim i As Long, j As Long
-    Dim dataRows As Long
-    Dim savePath As String
-    Dim codesStr As String
+    $badCodes = @()
+    if (Test-Path $mismatchPath) {
+        $badCodes = Get-Content $mismatchPath |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -ne "" } |
+            Select-Object -Unique
+    }
 
-    ' Use folder for THIS RUN only
-    folderPath = Environ$("MERGE_TARGET")
-    If Len(folderPath) = 0 Then
-        MsgBox "MERGE_TARGET not set. Aborting.", vbCritical
-        Exit Sub
-    End If
-    If Right$(folderPath, 1) <> "\" Then folderPath = folderPath & "\"
+    if ($badCodes.Count -eq 0) {
+        Write-Host "✅ Validation OK. No mismatches."
+        break
+    }
 
-    ' Only merge files that were moved in THIS RUN
-    codesStr = Environ$("MERGE_CODES")
-    If Len(codesStr) = 0 Then
-        MsgBox "MERGE_CODES not set. Aborting.", vbCritical
-        Exit Sub
-    End If
-    texts = Split(codesStr, ",")
+    Write-Host "⚠️ Mismatch detected for: $($badCodes -join ', ')"
+    Write-Host "🧹 Deleting mismatched TB files and re-downloading..."
 
-    Set wsDest = Workbooks.Add(xlWBATWorksheet).Worksheets(1)
-    On Error Resume Next
-    wsDest.Name = "Merged"
-    On Error GoTo 0
+    # Delete mismatched TB files in run folder (and merged file too, to avoid confusion)
+    foreach ($code in $badCodes) {
+        $p = Join-Path $RunFolder ($code + ".xlsx")
+        if (Test-Path $p) { Remove-Item $p -Force }
+    }
+    $mergedFile = Join-Path $RunFolder "Merged_Files.xlsx"
+    if (Test-Path $mergedFile) { Remove-Item $mergedFile -Force }
 
-    For i = LBound(texts) To UBound(texts)
-        fileName = folderPath & texts(i) & ".xlsx"
-        If Dir(fileName) <> "" Then
-            Set wbSource = Workbooks.Open(fileName, ReadOnly:=True)
-            Set wsSource = wbSource.Sheets(1)
+    # Re-download only the mismatched codes
+    Click-At $tab1.X $tab1.Y
+    Press-Enter
 
-            lastRowSource = wsSource.Cells(wsSource.Rows.Count, 1).End(xlUp).Row
-            lastRowDest = wsDest.Cells(wsDest.Rows.Count, 1).End(xlUp).Row
-            If lastRowDest < 1 Then lastRowDest = 1
-            If wsDest.Range("A1").Value <> "" Then lastRowDest = lastRowDest + 1
+    foreach ($code in $badCodes) {
+        [void](Download-OneCode $code)
+        if (-not ($movedCodes.Contains($code))) {
+            $movedCodes.Add($code) | Out-Null
+        }
+    }
 
-            If wsDest.Range("A1").Value = "" Then
-                ' First paste includes header
-                wsSource.Range("A1:F" & lastRowSource).Copy wsDest.Range("A1")
-                dataRows = lastRowSource
-            Else
-                ' Subsequent pastes exclude header
-                If lastRowSource > 1 Then
-                    wsSource.Range("A2:F" & lastRowSource).Copy wsDest.Range("A" & lastRowDest)
-                    dataRows = lastRowSource - 1
-                Else
-                    dataRows = 0
-                End If
-            End If
+    $attempt++
+} while ($attempt -lt $MaxRetries)
 
-            ' Tag the source code in column G
-            If dataRows > 0 Then
-                For j = 0 To dataRows - 1
-                    wsDest.Cells(lastRowDest + j, 7).Value = texts(i)
-                Next j
-            End If
+if (Test-Path $mismatchPath) {
+    $left = (Get-Content $mismatchPath | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" } | Select-Object -Unique)
+    if ($left.Count -gt 0) {
+        Write-Host "❗ Still mismatches after $MaxRetries retries: $($left -join ', ')"
+        Write-Host "Check the merged file + source text column used for extraction (SRC_TEXT_COL in VBA)."
+    }
+}
 
-            wbSource.Close False
-        End If
-    Next i
-
-    savePath = folderPath & "Merged_Files.xlsx"
-    wsDest.Parent.SaveAs Filename:=savePath, FileFormat:=xlOpenXMLWorkbook
-    MsgBox "Merging completed and saved to: " & savePath
-End Sub
-'@
-
-# Inject and run the macro
-# Ensure Excel setting: Developer → Macro Security → "Trust access to the VBA project object model"
-$vbModule = $workbook.VBProject.VBComponents.Add(1)  # 1 = vbext_ct_StdModule
-$vbModule.CodeModule.AddFromString($macroCode)
-$excelApp.Run("MergeFilesIntoOneSheetWithName")
-
-Start-Sleep -Seconds 5
-$excelApp.Quit()
-[System.Runtime.Interopservices.Marshal]::ReleaseComObject($excelApp) | Out-Null
-
+Write-Host "Done. Run folder: $RunFolder"
